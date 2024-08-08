@@ -1,181 +1,175 @@
-#include <assert.h>
-#include <stdint.h>
+//make sure to compile with the -luring flag.
+#define _GNU_SOURCE
+#include <liburing.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
-#include <string.h>
 
 #define PORT 8888
-#define BUFFER_SIZE 1024
+#define QUEUE_DEPTH 256
+#define BACKLOG 10
+#define MAX_MESSAGE_LEN 2048
+#define MAX_CONNECTIONS 1024
 
-const size_t max_message_len = 4096;
+enum event_type {
+    EVENT_TYPE_ACCEPT,
+    EVENT_TYPE_READ,
+    EVENT_TYPE_WRITE
+};
 
-//TODO: make a function that calls read and write functions, has its own buffer that scopes the transacrtion.
-// 2. make sure reads and writes are buffered such that only a single syscall is made.
+struct connection_info {
+    int fd;
+    char buffer[MAX_MESSAGE_LEN];
+    int bytes_read;
+};
 
-//read n bytes from file descriptor into buffer.
-static int32_t read_all(int fd, char* buf, size_t n) {
-    //reads all bytes including header and message
-    while (n > 0){
-        ssize_t read_value = read(fd, buf, n);
-        if (read_value <= 0) {
-            //error or unexpected EOF
-            return -1;
-        }
-        assert((size_t)read_value <= n);
-        n -= (size_t)read_value;
-        //necessary in case of partial reads.
-        //ensures data is not overwritten (corrupted)
-        buf += read_value;
-    }
-    //terminate the message
-    //buf[n] = '\0';
-    return 0;
+struct io_uring ring;
+
+void fatal_error(const char *msg) {
+    perror(msg);
+    exit(EXIT_FAILURE);
 }
 
-
-//write n bytes to the file descriptor from the bufer.
-//TODO: make sure the buffer points to the data and not the terminator
-static int32_t write_all(int fd, char *buf, size_t n) {
-    while (n > 0) {
-        ssize_t written_value = write(fd, buf, n);
-        if (written_value <=0) {
-            return -1;
-        }
-        assert((size_t)written_value <= n);
-        n-= (size_t)written_value;
-        //necessary for partial writes
-        //ensures data is not rewritten(corrupted)
-        buf += written_value;
+void add_accept_request(int server_fd, struct sockaddr_in *client_addr, socklen_t *client_len) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    if (!sqe) {
+        fatal_error("io_uring_get_sqe for accept");
     }
-    return 0;
+    io_uring_prep_accept(sqe, server_fd, (struct sockaddr *)client_addr, client_len, 0);
+    io_uring_sqe_set_data64(sqe, EVENT_TYPE_ACCEPT);
 }
 
-
-//one fo three operations [READ, WRITE, CLOSE]
-void close_active_socket(int fd) {
-    close(fd);
+void add_read_request(struct connection_info *conn) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    if (!sqe) {
+        fatal_error("io_uring_get_sqe for read");
+    }
+    io_uring_prep_recv(sqe, conn->fd, conn->buffer, MAX_MESSAGE_LEN, 0);
+    io_uring_sqe_set_data64(sqe, EVENT_TYPE_READ);
+    io_uring_sqe_set_data(sqe, conn);
 }
 
-//one fo three operations [READ, WRITE, CLOSE]
-int write_socket(int fd, char *buf, int32_t n) {
-    return write_all(fd, buf, (4 + n));
+void add_write_request(struct connection_info *conn) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    if (!sqe) {
+        fatal_error("io_uring_get_sqe for write");
+    }
+    io_uring_prep_send(sqe, conn->fd, conn->buffer, conn->bytes_read, 0);
+    io_uring_sqe_set_data64(sqe, EVENT_TYPE_WRITE);
+    io_uring_sqe_set_data(sqe, conn);
 }
 
-//works on a single client
-//one of three operations [READ, WRITE, CLOSE]
-int read_socket(int fd) {
-    char read_buffer[4 + max_message_len + 1];
-    //read first 4 bytes for the length of the message.
-    int32_t err = read_all(fd, read_buffer, 4); 
-    if(err < 0) {
-        printf("failed to read protocol bytes");
-        return err;
-    }
+int setup_listening_socket(int port) {
+    int server_fd;
+    struct sockaddr_in server_addr;
 
-    const char *error_message = "message too long";
-    const char *read_error = "failed to read message";
-    uint32_t len = 0;
-
-    memcpy(&len, read_buffer, 4);
-    //TODO: handle long messages better.
-    //long messages dont need to kill connection.
-    if (len > max_message_len) {
-        int error_sent = send(fd, error_message, strlen(error_message), 0);
-        if (error_sent == -1) {
-            perror("failed to send error message.");
-            return -1;
-        }
-        return -1;
-    }
-
-    //NOTE:we use &read_buffer[4] because the modification in read_all and write_all is of a copy of the pointer and not the actual pointer.
-    err = read_all(fd, &read_buffer[4], len);
-    if (err < 0) {
-        int error_sent = send(fd, error_message, strlen(read_error), 0);
-        if (error_sent == -1) {
-            perror("failed to send error message.");
-            return -1;
-        }
-        return -1;
-    }
-    
-    //set the last element to '\0' nil termination
-    read_buffer[4 + len] = '\0';
-    printf("client says: %s\n", &read_buffer[4]);
-
-    //NOTE: respond with the same protocol.
-
-    return write_all(fd, read_buffer, 4 + len);
-
-
-}
-
-
-
-
-int main() {
-	//file descriptors for client and server.
-    int server_fd, client_fd;
-	//adresses
-    struct sockaddr_in server_addr, client_addr;
-    socklen_t client_len = sizeof(client_addr);
-	//buffer for comms
-    char buffer[BUFFER_SIZE];
-
-    // create socket
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
-        perror("Socket creation failed");
-        exit(EXIT_FAILURE);
+        fatal_error("Socket creation failed");
     }
 
-    // Set up server address struct
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(PORT);
+    server_addr.sin_port = htons(port);
 
-    // Bind socket to address
     if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("Bind failed");
-        exit(EXIT_FAILURE);
+        fatal_error("Bind failed");
     }
 
-    // Listen for connections
-    if (listen(server_fd, 3) < 0) {
-        perror("Listen failed");
-        exit(EXIT_FAILURE);
+    if (listen(server_fd, BACKLOG) < 0) {
+        fatal_error("Listen failed");
     }
 
+    return server_fd;
+}
+
+void handle_accept(struct io_uring *ring, int server_fd, struct sockaddr_in *client_addr, socklen_t *client_len) {
+    struct connection_info *conn_info = malloc(sizeof(*conn_info));
+    if (!conn_info) {
+        fatal_error("malloc");
+    }
+    conn_info->fd = server_fd;
+    add_read_request(conn_info);
+    add_accept_request(server_fd, client_addr, client_len);
+}
+
+void handle_read(struct io_uring *ring, struct io_uring_cqe *cqe) {
+    struct connection_info *conn_info = io_uring_cqe_get_data(cqe);
+    if (cqe->res > 0) {
+        conn_info->bytes_read = cqe->res;
+        printf("Received %d bytes: %.*s\n", cqe->res, cqe->res, conn_info->buffer);
+        add_write_request(conn_info);
+    } else if (cqe->res == 0) {
+        printf("Connection closed\n");
+        close(conn_info->fd);
+        free(conn_info);
+    } else {
+        fprintf(stderr, "Read error: %s\n", strerror(-cqe->res));
+        close(conn_info->fd);
+        free(conn_info);
+    }
+}
+
+void handle_write(struct io_uring *ring, struct io_uring_cqe *cqe) {
+    struct connection_info *conn_info = io_uring_cqe_get_data(cqe);
+    if (cqe->res > 0) {
+        printf("Sent %d bytes\n", cqe->res);
+        add_read_request(conn_info);
+    } else {
+        fprintf(stderr, "Write error: %s\n", strerror(-cqe->res));
+        close(conn_info->fd);
+        free(conn_info);
+    }
+}
+
+int main() {
+    int server_fd;
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
+
+    server_fd = setup_listening_socket(PORT);
     printf("Server listening on port %d\n", PORT);
 
-    while (1) {
-        // Accept incoming connection
-        if ((client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len)) < 0) {
-            perror("Accept failed");
-            continue;
-        }
-
-        printf("New connection accepted\n");
-
-        //keep track of connection
-        int result;
-        do {
-
-            //the [READ, WRITE, CLOSE] functions are chained for now for convinience.
-            //TODO: unchain functions for event loop implementation.
-           result = read_socket(client_fd);
-
-        } while (result >= 0);
-
-        //cleanup connection.
-        close_active_socket(client_fd);
-        printf("Connection closed\n");
-        printf("waiting for new connection...");
+    if (io_uring_queue_init(QUEUE_DEPTH, &ring, 0) < 0) {
+        fatal_error("io_uring_queue_init");
     }
 
-    //TODO:; close server with signal.
+    add_accept_request(server_fd, &client_addr, &client_len);
+
+    struct io_uring_cqe *cqe;
+    while (1) {
+        int ret = io_uring_submit(&ring);
+        if (ret < 0) {
+            fatal_error("io_uring_submit");
+        }
+
+        ret = io_uring_wait_cqe(&ring, &cqe);
+        if (ret < 0) {
+            fatal_error("io_uring_wait_cqe");
+        }
+
+        enum event_type event_type = (enum event_type)cqe->user_data;
+
+        switch (event_type) {
+            case EVENT_TYPE_ACCEPT:
+                handle_accept(&ring, cqe->res, &client_addr, &client_len);
+                break;
+            case EVENT_TYPE_READ:
+                handle_read(&ring, cqe);
+                break;
+            case EVENT_TYPE_WRITE:
+                handle_write(&ring, cqe);
+                break;
+        }
+
+        io_uring_cqe_seen(&ring, cqe);
+    }
+
+    io_uring_queue_exit(&ring);
     close(server_fd);
+
     return 0;
 }
