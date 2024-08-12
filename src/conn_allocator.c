@@ -22,14 +22,13 @@ struct Pool {
 
     //pointer to the head of the free list.
     Pool_Free_Node *head;
-
 };
 
 
 void pool_free_all(Pool *pool);
 
 bool is_power_of_two(uintptr_t x) {
-    return (x &(x - 1));
+    return (x &(x - 1)) == 0;
 }
 uintptr_t align_forward(uintptr_t ptr, size_t align) {
     uintptr_t p, a, modulo;
@@ -49,31 +48,29 @@ uintptr_t align_forward(uintptr_t ptr, size_t align) {
     return p;
 }
 
-size_t align_forward_size()
+size_t align_forward_size(size_t size, size_t align) {
+    size_t modulo = size & (align - 1);
+    if (modulo != 0) {
+        size += align - modulo;
+    }
+    return size;
+}
 
-
-//initialize the pool(fixed sized chunks)
-//alignment and size logic done now.
 void pool_init(Pool *pool, void *backing_buffer, size_t backing_buffer_length, size_t chunk_size, size_t chunk_alignment) {
-    //align backing buffer to the specified chunk alignment
     uintptr_t initial_start = (uintptr_t)backing_buffer;
     uintptr_t start = align_forward(initial_start, (uintptr_t)chunk_alignment);
     backing_buffer_length -= (size_t)(start - initial_start);
 
-    //align chunk size up to the required chunk alignment
     chunk_size = align_forward_size(chunk_size, chunk_alignment);
 
-    //assert that the parameters passed are valid
     assert(chunk_size >= sizeof(Pool_Free_Node) && "chunk size is too small");
     assert(backing_buffer_length >= chunk_size && "backing buffer length is smaller than the chunk size");
 
-    // store the adjacent parameters
     pool -> buf = (unsigned char *)backing_buffer;
     pool -> buf_len = backing_buffer_length;
     pool -> chunk_size = chunk_size;
     pool -> head = NULL;
 
-    //set up the free list for free chunks
     pool_free_all(pool);
 }
 
@@ -86,10 +83,7 @@ void *pool_alloc(Pool *pool) {
         return NULL;
     }
 
-    //pop free node
     pool -> head = pool -> head -> next;
-    //
-    //zero memory by default
     return memset(node, 0, pool -> chunk_size);
 }
 
@@ -109,7 +103,6 @@ void pool_free(Pool *pool, void *ptr) {
         return;
     }
 
-    //push free node
     node = (Pool_Free_Node *)ptr;
     node -> next = pool -> head;
     pool -> head = node;
