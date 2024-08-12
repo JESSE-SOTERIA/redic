@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <stdbool.h>
 
 
 typedef struct Pool_Free_Node Pool_Free_Node;  
@@ -27,13 +28,36 @@ struct Pool {
 
 void pool_free_all(Pool *pool);
 
+bool is_power_of_two(uintptr_t x) {
+    return (x &(x - 1));
+}
+uintptr_t align_forward(uintptr_t ptr, size_t align) {
+    uintptr_t p, a, modulo;
+
+    assert(is_power_of_two(align));
+
+    p = ptr;
+    a = (uintptr_t)align;
+    //same as p % a buf faster as p is a power of 2
+    modulo = p & (a - 1);
+
+    if (modulo != 0) {
+        //if p address is not aligned, push the address to the
+        //next value which is aligned
+        p += a - modulo;
+    }
+    return p;
+}
+
+size_t align_forward_size()
+
 
 //initialize the pool(fixed sized chunks)
 //alignment and size logic done now.
 void pool_init(Pool *pool, void *backing_buffer, size_t backing_buffer_length, size_t chunk_size, size_t chunk_alignment) {
     //align backing buffer to the specified chunk alignment
     uintptr_t initial_start = (uintptr_t)backing_buffer;
-    uintptr_t start = align_forward_uintprt(initial_start, (uintptr_t)chunk_alignment);
+    uintptr_t start = align_forward(initial_start, (uintptr_t)chunk_alignment);
     backing_buffer_length -= (size_t)(start - initial_start);
 
     //align chunk size up to the required chunk alignment
