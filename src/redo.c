@@ -28,7 +28,6 @@ enum event_type {
 };
 
 //NOTE: we have ring which all connections use.
-struct io_uring ring;
 struct Pool connection_pool;
 
 
@@ -51,12 +50,12 @@ void fatal_error(const char *msg) {
 }
 
 //write_event
-void add_write_event(struct connection_info *conn) {
+void add_write_event(struct connection_info *conn, struct io_uring *ring) {
     enum event_type state;
     state = READ_EVENT;
 
     //make an sqe
-    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     if (!sqe) {
         fatal_error("failed to get submission queue element");
     }
@@ -67,11 +66,11 @@ void add_write_event(struct connection_info *conn) {
 }
 
 //read_event
-void add_read_event(struct connection_info *conn) {
+void add_read_event(struct connection_info *conn, struct io_uring *ring) {
     enum event_type state;
     state = WRITE_EVENT;
     //make an sqe
-    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     if (!sqe) {
         fatal_error("failed to get sqe for read");
     }
@@ -108,11 +107,11 @@ void add_accept_event(int server_fd, struct io_uring *new_ring, Pool *pool ){
 
 
 //function wrappers 
-void handle_write(struct io_uring_cqe *cqe, Connection *conn, Pool *pool) {
+void handle_write(struct io_uring_cqe *cqe, Connection *conn, Pool *pool, struct io_uring *ring) {
     //check if the previous operation was successful.
     if (cqe->res > 0) {
         printf("queueing write...\n");
-        add_write_event(conn);
+        add_write_event(conn, ring);
     } else {
         //NOTE: print read error because res is the success value of the previous operation.
         fprintf(stderr, "Read error: %s\n", strerror(-cqe->res));
@@ -124,7 +123,7 @@ void handle_write(struct io_uring_cqe *cqe, Connection *conn, Pool *pool) {
 void handle_read(struct io_uring *ring, struct io_uring_cqe *cqe, Connection *conn, Pool *pool) {
     if (cqe -> res > 0) {
         printf("queueing read...\n");
-        add_read_event(conn);
+        add_read_event(conn, ring);
     } else {
         fprintf(stderr, "Write error: %s\n", strerror(-cqe->res));
         close(conn -> fd);
@@ -156,23 +155,25 @@ int set_up_listening_socket(int port){
 }
 
 int main() {
+
+    struct io_uring *ring = (struct io_uring *)malloc(sizeof(struct io_uring));
     int server_fd = set_up_listening_socket(PORT); 
     // TODO: implement our allocator to allocate to this buffer.
     Connection connections_buffer[MAX_CONNECTIONS];
-    struct io_uring rings[MAX_CONNECTIONS];
+    
 
     //connection pool, universal.
     pool_init(&connection_pool, connections_buffer, sizeof(connections_buffer), sizeof(Connection), _Alignof(Connection));
 
-    add_accept_event(server_fd, &ring, &connection_pool);
+    add_accept_event(server_fd, ring, &connection_pool);
 
     while (1) {
-       io_uring_submit(&ring);
+       io_uring_submit(ring);
        struct io_uring_cqe *cqe;
         unsigned head;
         unsigned count = 0;
 
-        io_uring_for_each_cqe(&ring, head, cqe) {
+        io_uring_for_each_cqe(ring, head, cqe) {
             count++;
 
             int res = cqe -> res;
@@ -183,22 +184,23 @@ int main() {
             } else {
                 switch (user_data -> state) {
                     case READ_EVENT:
-                        handle_read(&ring, cqe, user_data, &connection_pool);
+                        handle_read(ring, cqe, user_data, &connection_pool);
                     break;
                     case WRITE_EVENT:
-                        handle_write(cqe, user_data, &connection_pool);
+                        handle_write(cqe, user_data, &connection_pool, ring);
                     break;
                     case ACCEPT_EVENT:
-                        add_accept_event(server_fd, &ring, &connection_pool);
+                        add_accept_event(server_fd, ring, &connection_pool);
                     break;
                 }
             }
 
-            io_uring_cq_advance(&ring, count);
+            io_uring_cq_advance(ring, count);
         }
     }
 
-    io_uring_queue_exit(&ring);
+    io_uring_queue_exit(ring);
+    free(ring);
     close(server_fd);
 
     return 0;
