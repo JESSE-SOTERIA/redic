@@ -27,7 +27,7 @@ enum event_type {
 };
 //TODO: make a pool allocator(buddie) and have it allocate memory for ring and connection info.
 
-//we need to manage the connections in pools and have functions to free connection data.
+//NOTE: we have ring which all connections use.
 struct io_uring ring;
 
 
@@ -39,11 +39,10 @@ typedef struct connection_info{
     struct sockaddr_in addr;
     socklen_t addr_len;
     enum event_type state;
-    struct io_uring *ring;
 }Connection;
 
-Connection* connection_malloc(struct io_uring *io_uring) {
-    Connection* new_connection = (Connection*)malloc(sizeof(Connection));
+Connection *connection_malloc(struct io_uring *io_uring) {
+    Connection *new_connection = (Connection*)malloc(sizeof(Connection));
     if (new_connection == NULL) {
         fprintf(stderr, "Memory allocation failed for Connection\n");
         return NULL;
@@ -54,7 +53,6 @@ Connection* connection_malloc(struct io_uring *io_uring) {
     memset(new_connection->buffer, 0, MAX_MESSAGE_LEN);
     new_connection->bytes_done = 5;
     new_connection->state = READ_EVENT;
-    new_connection->ring = io_uring;
     
     return new_connection;
 }
@@ -70,9 +68,6 @@ struct accept_data {
     socklen_t client_len;
 };
 
-//I can make this call back do anything.
-//will decide what makes most sense.
-typedef int (*callback_function)(struct connection_info *connection); 
 
 //error handling fucntion
 void fatal_error(const char *msg) {
@@ -82,6 +77,9 @@ void fatal_error(const char *msg) {
 
 //write_event
 void add_write_event(struct connection_info *conn) {
+    enum event_type state;
+    state = READ_EVENT;
+
     //make an sqe
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
     if (!sqe) {
@@ -89,14 +87,14 @@ void add_write_event(struct connection_info *conn) {
     }
 
     io_uring_prep_send(sqe, conn -> fd , conn -> buffer, conn -> bytes_done, 0);
-    io_uring_sqe_set_data64(sqe, READ_EVENT);
+    conn -> state = state;
     io_uring_sqe_set_data(sqe, conn);
-    //TODO: make it so that ther isn't a submit after every event prep.
-    io_uring_submit(conn -> ring);
 }
 
 //read_event
 void add_read_event(struct connection_info *conn) {
+    enum event_type state;
+    state = WRITE_EVENT;
     //make an sqe
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
     if (!sqe) {
@@ -105,38 +103,36 @@ void add_read_event(struct connection_info *conn) {
 
     //NOTE: you must say hello (or any oner five letter word really) to the server before you continue conversing.
     io_uring_prep_read(sqe, conn -> fd, conn -> buffer,  conn -> bytes_done, 0);
-    io_uring_sqe_set_data64(sqe, WRITE_EVENT);
+    conn -> state = state;
     io_uring_sqe_set_data(sqe, conn);
-    //TODO: make it so that ther isn't a submit after every event prep.
-    io_uring_submit(conn -> ring);
 }
 
 //should return a pointer to a Connection variable with all the connection for the related client set.
-Connection *add_accept_event(int server_fd, struct io_uring *new_ring ){
+void add_accept_event(int server_fd, struct io_uring *new_ring ){
 
+    enum event_type state;
+    state = READ_EVENT;
+
+    //TODO: make it so that our pool allocator is the one that allocatoes space for the connection
+    //make sure to handle all cases of Null.
     Connection* new_connection = connection_malloc(new_ring);
     struct accept_data *data = malloc(sizeof(*data));
     data -> client_len = sizeof(data -> client_address);
 
-    if (new_connection || data == NULL) {
+    //TODO: check if we can just write (new_connection || data)
+    if (new_connection == NULL || data == NULL) {
         fatal_error("failed to allocate memory for new connection or client data.");
     }
 
-    //TODO: make these changes inthe completion entry.
-    //new_connection -> addr = data -> client_address;
-    //new_connection ->addr_len = data -> client_len; 
     struct io_uring_sqe *sqe = io_uring_get_sqe(new_ring);
-
     if (!sqe) {
         fatal_error("failed to get sqe for read");
     }
 
     io_uring_prep_accept(sqe, server_fd, (struct sockaddr *)&data -> client_address, &data ->client_len, 0);
-    //TODO: the read event enum value can only be accessed from the function io_uring_get_data64. 
-    io_uring_sqe_set_data64(sqe, READ_EVENT);
-    io_uring_submit(new_connection -> ring);
+    new_connection -> state = state;
+    io_uring_sqe_set_data(sqe, new_connection);
 
-    return new_connection;
 }
 
 //function wrappers 
@@ -189,15 +185,42 @@ int set_up_listening_socket(int port){
 
 int main() {
     int server_fd = set_up_listening_socket(PORT); 
-    // TODO: implement our allocator to allocato to this buffer.
+    // TODO: implement our allocator to allocate to this buffer.
     Connection connections[MAX_CONNECTIONS];
     struct io_uring rings[MAX_CONNECTIONS];
 
+    add_accept_event(server_fd, &ring);
+
     while (1) {
-        struct io_uring new_ring = ring_malloc();
-        add_accept_event(server_fd, struct io_uring *new_ring);
-        
-        
+       io_uring_submit(&ring);
+       struct io_uring_cqe *cqe;
+        unsigned head;
+        unsigned count = 0;
+
+        io_uring_for_each_cqe(&ring, head, cqe) {
+            count++;
+
+            int res = cqe -> res;
+            Connection *user_data = (Connection *)io_uring_cqe_get_data(cqe);
+
+            if (res < 0) {
+                fatal_error("something bad happened while processing event.");
+            } else {
+                switch (user_data -> state) {
+                    case READ_EVENT:
+                        handle_read(&ring, cqe, user_data);
+                    break;
+                    case WRITE_EVENT:
+                        handle_write(cqe, user_data);
+                    break;
+                    case ACCEPT_EVENT:
+                        add_accept_event(server_fd, &ring);
+                    break;
+                }
+            }
+
+            io_uring_cq_advance(&ring, count);
+        }
     }
 
     io_uring_queue_exit(&ring);
