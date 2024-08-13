@@ -56,6 +56,20 @@ size_t align_forward_size(size_t size, size_t align) {
     return size;
 }
 
+void pool_make_free_list(Pool *pool) {
+    size_t chunk_count = pool -> buf_len / pool -> chunk_size;
+    size_t i;
+
+    //set all chunks to be free
+    for (i = 0; i < chunk_count; i++) {
+        void *ptr = &pool -> buf[i * pool -> chunk_size];
+        Pool_Free_Node *node = (Pool_Free_Node *)ptr;
+        //push free Node onto the next free list
+        node  -> next = pool -> head;
+        pool -> head = node;
+    }
+}
+
 void pool_init(Pool *pool, void *backing_buffer, size_t backing_buffer_length, size_t chunk_size, size_t chunk_alignment) {
     uintptr_t initial_start = (uintptr_t)backing_buffer;
     uintptr_t start = align_forward(initial_start, (uintptr_t)chunk_alignment);
@@ -71,7 +85,7 @@ void pool_init(Pool *pool, void *backing_buffer, size_t backing_buffer_length, s
     pool -> chunk_size = chunk_size;
     pool -> head = NULL;
 
-    pool_free_all(pool);
+    pool_make_free_list(pool);
 }
 
 
@@ -110,16 +124,3 @@ void pool_free(Pool *pool, void *ptr) {
 }
 
 
-void pool_free_all(Pool *pool) {
-    size_t chunk_count = pool -> buf_len / pool -> chunk_size;
-    size_t i;
-
-    //set all chunks to be free
-    for (i = 0; i < chunk_count; i++) {
-        void *ptr = &pool -> buf[i * pool -> chunk_size];
-        Pool_Free_Node *node = (Pool_Free_Node *)ptr;
-        //push free Node onto the next free list
-        node  -> next = pool -> head;
-        pool -> head = node;
-    }
-}
