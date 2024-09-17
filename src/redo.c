@@ -156,24 +156,29 @@ int set_up_listening_socket(int port){
 
 int main() {
 
-    struct io_uring *ring = (struct io_uring *)malloc(sizeof(struct io_uring));
+    struct io_uring ring;
+    int ret = io_uring_queue_init(32, &ring, 0);
+    if (ret < 0) {
+        fprintf(stderr, "io_uring initialization failed\n");
+    }
     int server_fd = set_up_listening_socket(PORT); 
     // TODO: implement our allocator to allocate to this buffer.
     Connection connections_buffer[MAX_CONNECTIONS];
+
     
 
     //connection pool, universal.
     pool_init(&connection_pool, connections_buffer, sizeof(connections_buffer), sizeof(Connection), _Alignof(Connection));
 
-    add_accept_event(server_fd, ring, &connection_pool);
+    add_accept_event(server_fd, &ring, &connection_pool);
 
     while (1) {
-       io_uring_submit(ring);
+       io_uring_submit(&ring);
        struct io_uring_cqe *cqe;
         unsigned head;
         unsigned count = 0;
 
-        io_uring_for_each_cqe(ring, head, cqe) {
+        io_uring_for_each_cqe(&ring, head, cqe) {
             count++;
 
             int res = cqe -> res;
@@ -184,23 +189,22 @@ int main() {
             } else {
                 switch (user_data -> state) {
                     case READ_EVENT:
-                        handle_read(ring, cqe, user_data, &connection_pool);
+                        handle_read(&ring, cqe, user_data, &connection_pool);
                     break;
                     case WRITE_EVENT:
-                        handle_write(cqe, user_data, &connection_pool, ring);
+                        handle_write(cqe, user_data, &connection_pool, &ring);
                     break;
                     case ACCEPT_EVENT:
-                        add_accept_event(server_fd, ring, &connection_pool);
+                        add_accept_event(server_fd, &ring, &connection_pool);
                     break;
                 }
             }
 
-            io_uring_cq_advance(ring, count);
+            io_uring_cq_advance(&ring, count);
         }
     }
 
-    io_uring_queue_exit(ring);
-    free(ring);
+    io_uring_queue_exit(&ring);
     close(server_fd);
 
     return 0;
