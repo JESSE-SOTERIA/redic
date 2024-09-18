@@ -57,16 +57,18 @@ void add_write_event(struct connection_info *conn, struct io_uring *ring) {
     //make an sqe
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     if (!sqe) {
-        fatal_error("failed to get submission queue element");
+        fatal_error("failed to get submission queue element for write event");
     }
 
     io_uring_prep_send(sqe, conn -> fd , conn -> buffer, conn -> bytes_done, 0);
+    //change the state of the connection to read to prepare for data cominng from the client
     conn -> state = state;
     io_uring_sqe_set_data(sqe, conn);
 }
 
 //read_event
 void add_read_event(struct connection_info *conn, struct io_uring *ring) {
+    printf("adding  read event...");
     enum event_type state;
     state = WRITE_EVENT;
     //make an sqe
@@ -114,18 +116,19 @@ void handle_write(struct io_uring_cqe *cqe, Connection *conn, Pool *pool, struct
         add_write_event(conn, ring);
     } else {
         //NOTE: print read error because res is the success value of the previous operation.
-        fprintf(stderr, "Read error: %s\n", strerror(-cqe->res));
+        fatal_error("failed to write becaluse no data was read.");
         close(conn->fd);
         pool_free(pool, conn);
     }
 }
 
-void handle_read(struct io_uring *ring, struct io_uring_cqe *cqe, Connection *conn, Pool *pool) {
+void handle_read(struct io_uring *ring, struct io_uring_cqe *cqe, struct connection_info *conn, Pool *pool) {
     if (cqe -> res > 0) {
         printf("queueing read...\n");
+        printf("cqe -> res %d\n", cqe->res);
         add_read_event(conn, ring);
     } else {
-        fprintf(stderr, "Write error: %s\n", strerror(-cqe->res));
+        fatal_error("failed to read beacause no data was written.");
         close(conn -> fd);
         pool_free(pool, conn);
     }
@@ -157,12 +160,13 @@ int set_up_listening_socket(int port){
 int main() {
 
     struct io_uring ring;
+    //initialize io_uring struct
     int ret = io_uring_queue_init(32, &ring, 0);
     if (ret < 0) {
-        fprintf(stderr, "io_uring initialization failed\n");
+        fatal_error( "io_uring initialization failed\n");
     }
     int server_fd = set_up_listening_socket(PORT); 
-    // TODO: implement our allocator to allocate to this buffer.
+    //array of individual connections
     Connection connections_buffer[MAX_CONNECTIONS];
 
     
@@ -182,7 +186,7 @@ int main() {
             count++;
 
             int res = cqe -> res;
-            Connection *user_data = (Connection *)io_uring_cqe_get_data(cqe);
+            struct connection_info *user_data = (Connection *)io_uring_cqe_get_data(cqe);
 
             if (res < 0) {
                 fatal_error("something bad happened while processing event.");
