@@ -20,6 +20,9 @@
 #define MAX_CONNECTIONS 1024
 #define MAX_EVENTS 56
 
+
+//TODO: make sure to timeout events (read, write and accept)
+
 //controll the operations to do on sockets and file descriptors
 enum event_type {
     WRITE_EVENT,
@@ -51,44 +54,36 @@ void fatal_error(const char *msg) {
 
 //write_event
 void add_write_event(struct connection_info *conn, struct io_uring *ring) {
-    enum event_type state;
-    state = READ_EVENT;
-
     //make an sqe
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     if (!sqe) {
         fatal_error("failed to get submission queue element for write event");
     }
 
-    io_uring_prep_send(sqe, conn -> fd , conn -> buffer, conn -> bytes_done, 0);
+
     //change the state of the connection to read to prepare for data cominng from the client
-    conn -> state = state;
+    conn -> state = READ_EVENT;
     io_uring_sqe_set_data(sqe, conn);
+    io_uring_prep_send(sqe, conn -> fd , conn -> buffer, conn -> bytes_done, 0);
 }
 
-//read_event
 void add_read_event(struct connection_info *conn, struct io_uring *ring) {
     printf("adding  read event...");
-    enum event_type state;
-    state = WRITE_EVENT;
-    //make an sqe
+
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     if (!sqe) {
         fatal_error("failed to get sqe for read");
     }
 
     //NOTE: you must say hello (or any oner five letter word really) to the server before you continue conversing.
-    io_uring_prep_read(sqe, conn -> fd, conn -> buffer,  conn -> bytes_done, 0);
-    conn -> state = state;
+    //the connection buffer is where the data is read to and written from
+    conn -> state = WRITE_EVENT;
     io_uring_sqe_set_data(sqe, conn);
+    io_uring_prep_read(sqe, conn -> fd, conn -> buffer,  conn -> bytes_done, 0);
 }
 
 //should return a pointer to a Connection variable with all the connection for the related client set.
 void add_accept_event(int server_fd, struct io_uring *new_ring, Pool *pool ){
-
-    enum event_type state;
-    state = READ_EVENT;
-
     Connection* new_connection = (Connection *)pool_alloc(pool); 
 
     //TODO: check if we can just write (new_connection || data)
@@ -101,10 +96,9 @@ void add_accept_event(int server_fd, struct io_uring *new_ring, Pool *pool ){
         fatal_error("failed to get sqe for read");
     }
 
-    io_uring_prep_accept(sqe, server_fd, (struct sockaddr *)&new_connection -> addr , &new_connection -> addr_len, 0);
-    new_connection -> state = state;
+    new_connection -> state = READ_EVENT;
     io_uring_sqe_set_data(sqe, new_connection);
-
+    io_uring_prep_accept(sqe, server_fd, (struct sockaddr *)&new_connection -> addr , &new_connection -> addr_len, 0);
 }
 
 
@@ -127,6 +121,7 @@ void handle_read(struct io_uring *ring, struct io_uring_cqe *cqe, struct connect
         printf("queueing read...\n");
         printf("cqe -> res %d\n", cqe->res);
         add_read_event(conn, ring);
+        printf("this point of the program has been reached.");
     } else {
         fatal_error("failed to read beacause no data was written.");
         close(conn -> fd);
@@ -192,10 +187,10 @@ int main() {
                 fatal_error("something bad happened while processing event.");
             } else {
                 switch (user_data -> state) {
-                    case READ_EVENT:
+                    case WRITE_EVENT :
                         handle_read(&ring, cqe, user_data, &connection_pool);
                     break;
-                    case WRITE_EVENT:
+                    case READ_EVENT:
                         handle_write(cqe, user_data, &connection_pool, &ring);
                     break;
                     case ACCEPT_EVENT:
